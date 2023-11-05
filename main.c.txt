@@ -1,0 +1,134 @@
+#include <esp_wifi.h>
+#include <esp_event.h>
+#include <esp_log.h>
+#include <esp_system.h>
+#include <nvs_flash.h>
+#include <sys/param.h>
+#include "esp_netif.h"
+#include "esp_eth.h"
+#include "protocol_examples_common.h"
+#include <esp_https_server.h>
+#include "esp_tls.h"
+#include "sdkconfig.h"
+#include "esp_timer.h"
+#include "driver/gpio.h"
+static const char *TAG = "app";
+void timer_callback(void *param)
+{
+    // printf("Rec: %d\n", (int)param);
+    gpio_set_level((int)param, 0);
+}
+static esp_err_t root_post_handler(httpd_req_t *req)
+{
+    char buf[3];
+    int ret;
+    ret = httpd_req_recv(req, buf, sizeof(buf));
+    if (ret < 3)
+    {
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_send(req, "Invalid Input", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    uint8_t motor = buf[0];
+    uint16_t time = *(uint16_t *)(buf + 1);
+    // printf("Motor: %d\n Time: %d\n", motor, time);
+    int pin = motor != 0 ? GPIO_NUM_2 : GPIO_NUM_12;
+    gpio_set_level(pin, 1);
+    const esp_timer_create_args_t oneshot_timer_args = {
+        .callback = &timer_callback,
+        /* argument specified here will be passed to timer callback function */
+        .arg = (void *)pin,
+        .name = "one-shot"};
+    esp_timer_handle_t oneshot_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&oneshot_timer_args, &oneshot_timer));
+    ESP_ERROR_CHECK(esp_timer_start_once(oneshot_timer, time * 1000));
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, "Command Sucessful", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+static const httpd_uri_t root = {
+    .uri = "/",
+    .method = HTTP_POST,
+    .handler = root_post_handler};
+static httpd_handle_t start_webserver(void)
+{
+    httpd_handle_t server = NULL;
+    // Start the httpd server
+    ESP_LOGI(TAG, "Starting server");
+    httpd_ssl_config_t conf = HTTPD_SSL_CONFIG_DEFAULT();
+    extern const unsigned char servercert_start[] asm("_binary_servercert_pem_start");
+    extern const unsigned char servercert_end[] asm("_binary_servercert_pem_end");
+    conf.servercert = servercert_start;
+    conf.servercert_len = servercert_end - servercert_start;
+    extern const unsigned char prvtkey_pem_start[] asm("_binary_prvtkey_pem_start");
+    extern const unsigned char prvtkey_pem_end[] asm("_binary_prvtkey_pem_end");
+    conf.prvtkey_pem = prvtkey_pem_start;
+    conf.prvtkey_len = prvtkey_pem_end - prvtkey_pem_start;
+    esp_err_t ret = httpd_ssl_start(&server, &conf);
+    if (ESP_OK != ret)
+    {
+        ESP_LOGI(TAG, "Error starting server!");
+        return NULL;
+    }
+    ESP_LOGI(TAG, "Registering URI handlers");
+    httpd_register_uri_handler(server, &root);
+    return server;
+}
+static esp_err_t stop_webserver(httpd_handle_t server)
+{
+    return httpd_ssl_stop(server);
+}
+static void disconnect_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    httpd_handle_t *server = (httpd_handle_t *)arg;
+    if (*server)
+    {
+        if (stop_webserver(*server) == ESP_OK)
+        {
+            *server = NULL;
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Failed to stop https server");
+        }
+    }
+}
+static void connect_handler(void *arg, esp_event_base_t event_base,
+                            int32_t event_id, void *event_data)
+{
+    httpd_handle_t *server = (httpd_handle_t *)arg;
+    if (*server == NULL)
+    {
+        *server = start_webserver();
+    }
+}
+void app_main(void)
+{
+    static httpd_handle_t *server = NULL;
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+#ifdef CONFIG_EXAMPLE_CONNECT_WIFI
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler, &server));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler, &server));
+#endif
+#ifdef CONFIG_EXAMPLE_CONNECT_ETHERNET
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &connect_handler, &server));
+    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ETHERNET_EVENT_DISCONNECTED, &disconnect_handler, &server));
+#endif
+    ESP_ERROR_CHECK(example_connect());
+#define GPIO_BIT_MASK ((1ULL << GPIO_NUM_12) | (1ULL << GPIO_NUM_2))
+    gpio_config_t io_conf;
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask = GPIO_BIT_MASK;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&io_conf);
+}
+
+
+
+
+
